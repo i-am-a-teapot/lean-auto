@@ -45,13 +45,17 @@ def unfoldProj (e : Expr) : MetaM Expr :=
       | throwError s!"{decl_name%} :: {name} is not a inductive type"
     let some structInfo := getStructureInfo? (← getEnv) name
       | throwError s!"{decl_name%} :: {name} is not a structure"
-    let nameMap : Std.HashMap Name StructureFieldInfo := Std.HashMap.ofList
-      (structInfo.fieldInfo.map (fun sfi => (sfi.fieldName, sfi))).toList
-    let sorted := structInfo.fieldNames.map (fun name => nameMap.get? name)
-    let .some (.some sfi) := sorted[idx]?
+    let some projection := structInfo.getProjFn? idx
       | throwError s!"{decl_name%} :: Projection index out of bound"
-    let nones : List (Option Expr) := (List.range indi.numParams).map (fun _ => .none)
-    Meta.mkAppOptM sfi.projFn ((Array.mk nones).push struct)
+    -- A primitive projection already fixes every structure parameter,
+    -- including the exact class instances used by dependent fields. Asking
+    -- instance search to reconstruct those parameters can fail or choose a
+    -- different instance. Recover them from the structure value's type.
+    let type ← Meta.whnf (← Meta.inferType struct)
+    let parameters := type.getAppArgs
+    unless type.getAppFn.isConstOf name && parameters.size == indi.numParams do
+      throwError s!"{decl_name%} :: Unexpected structure type {type}"
+    Meta.mkAppOptM projection ((parameters.map some).push (some struct))
   | _ => return e
 
 def prepReduceExprWithMode (term : Expr) (mode : TransparencyMode) : MetaM Expr := do
@@ -92,8 +96,22 @@ def prepReduceDefeq (type : Expr) : MetaM (Option Expr) := do
     let eq' := Lean.mkApp3 (.const ``Eq lvls) ty lhs rhs
     return .some (← mkForallFVars xs eq')
 
+/-- Expose function-type aliases without unfolding propositions used as domains.
+For example `Set α` is an arrow type, whereas `¬p` must remain a proposition:
+expanding it here introduces logical constants after instance collection. -/
+private partial def normalizeFunctionTypeAliases (e : Expr) : MetaM Expr := do
+  if ← Meta.isProp e then return e
+  let e' ← Meta.withDefault <| Meta.whnfNondependentForall e
+  match e' with
+  | .forallE name domain body bi =>
+    if body.hasLooseBVar 0 then return e
+    return .forallE name (← normalizeFunctionTypeAliases domain)
+      (← normalizeFunctionTypeAliases body) bi
+  | _ => return e
+
 def prepReduceTypeForall (e : Expr) : MetaM Expr := do
   let e ← prepReduceExpr e
+  let e ← normalizeFunctionTypeAliases e
   let mode := auto.mono.tyRed.mode.get (← getOptions)
   Meta.withTransparency mode <| Meta.normalizeNondependentForall e
 
