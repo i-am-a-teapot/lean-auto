@@ -69,7 +69,10 @@ def Meta.trySynthInhabited (e : Expr) : MetaM (Option Expr) := do
   let .sort lvl := eSort
     | throwError "{decl_name%} :: {e} is not a type"
   try
-    if let .some inh ← Meta.synthInstance? e then
+    -- An ordinary type need not itself be a class. Failure of this first
+    -- attempt must still allow its Inhabited and Nonempty instances below.
+    let direct? ← try Meta.synthInstance? e catch _ => pure none
+    if let .some inh := direct? then
       return .some inh
     if let .some inh ← Meta.synthInstance? (Lean.mkApp (.const ``Inhabited [lvl]) e) then
       return .some (Lean.mkApp2 (.const ``Inhabited.default [lvl]) e inh)

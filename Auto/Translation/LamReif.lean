@@ -988,7 +988,7 @@ def newTypeExpr (e : Expr) : ReifM LamSort := do
   let idx := tyVal.size
   -- The universe level of `e`
   let origSort ← Meta.inferType e
-  let origSort := (← instantiateMVars origSort).headBeta
+  let origSort ← Meta.whnf (← instantiateMVars origSort)
   let .sort lvl := origSort
     | throwError "{decl_name%} :: Unexpected sort {origSort}"
   setTyVal (tyVal.push (e, lvl))

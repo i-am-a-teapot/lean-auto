@@ -105,8 +105,26 @@ register_option auto.mono.ignoreNonQuasiHigherOrder : Bool := {
 }
 
 
+register_option auto.mono.ignoreUnsupportedFactPrefixes : String := {
+  defValue := ""
+  descr := "Semicolon-separated derivation-label prefixes for optional facts " ++
+           "that may be omitted when higher-order abstraction is unsupported"
+}
+
+
 namespace Auto.Monomorphization
 open Embedding
+
+/-- A mixed derivation containing a required leaf must never be omitted. -/
+private partial def derivesOnlyFromPrefixes (prefixes : List String) : DTr → Bool
+  | .leaf label => prefixes.any (fun labelPrefix => label.startsWith labelPrefix)
+  | .node _ premises => !premises.isEmpty && premises.all (derivesOnlyFromPrefixes prefixes)
+
+private def mayOmitUnsupportedFact (derivation : DTr) : CoreM Bool := do
+  if auto.mono.ignoreNonQuasiHigherOrder.get (← getOptions) then return true
+  let prefixes := (auto.mono.ignoreUnsupportedFactPrefixes.get (← getOptions)).splitOn ";"
+    |>.filter (!·.isEmpty)
+  return derivesOnlyFromPrefixes prefixes derivation
 
 def getRecordInstInst : CoreM Bool := do
   return auto.mono.recordInstInst.get (← getOptions)
@@ -296,7 +314,8 @@ def ConstInst.ofExpr? (params : Array Name) (bvars : Array Expr) (e : Expr) : Me
   let mut argsInst := #[]
   -- Check that all dependent and instance arguments are instantiated
   for (arg, idx) in args.zipIdx do
-    headType ← Core.betaReduce headType
+    -- Function types may be definition aliases, for example `Set α`.
+    headType ← Meta.withTransparency .default <| Meta.whnf headType
     let .forallE _ ty body bi := headType
       | throwError "{decl_name%} :: {headType} is not a `∀`"
     if let some _ := ty.find? (fun e => bvarSet.contains e) then
@@ -307,7 +326,7 @@ def ConstInst.ofExpr? (params : Array Name) (bvars : Array Expr) (e : Expr) : Me
       argsIdx := argsIdx.push idx
       argsInst := argsInst.push arg
     headType := body.instantiate1 arg
-  headType ← Core.betaReduce headType
+  headType ← Meta.withTransparency .default <| Meta.whnf headType
   if (Expr.depArgs headType).size != 0 || (Expr.instArgs headType).size != 0 then
     return .none
   return .some ⟨head, argsInst, argsIdx⟩
@@ -329,23 +348,25 @@ where
     | .hol => return dep || inst
     | .fol => return dep || (!isPolyIL && hol) || inst
 
-private def ConstInst.toExprAux (args : List (Option Expr))
-  (tys : List (Name × Expr × BinderInfo)) (e ty : Expr) : Option Expr :=
+private partial def ConstInst.toExprAux (args : List (Option Expr))
+  (e ty : Expr) : MetaM Expr := do
   match args with
-  | .nil =>
-    Option.some <| Prod.fst <| tys.foldl (fun (e, idx) (name, bty, bi) =>
-      (Expr.lam name bty e bi, .succ idx)) (e, 0)
+  | .nil => return e
   | .none :: args' =>
-    match ty with
+    match ← Meta.whnf ty with
     | .forallE name bty body bi =>
-      let bvar := .bvar tys.length
-      toExprAux args' ((name, bty, bi) :: tys) (.app e bvar) (body.instantiate1 bvar)
-    | _ => .none
+      -- Abstract with fresh locals instead of assigning de Bruijn indices
+      -- before all binders are known. Adding a second binder must not swap
+      -- the first two arguments or capture an instantiated argument.
+      Meta.withLocalDecl name bi bty fun argument => do
+        let result ← toExprAux args' (.app e argument) (body.instantiate1 argument)
+        Meta.mkLambdaFVars #[argument] result
+    | _ => throwError "Auto.Monomorphization.ConstInst.toExpr :: Expected a function binder"
   | .some arg :: args' =>
-    match ty with
+    match ← Meta.whnf ty with
     | .forallE _ _ body _ =>
-      toExprAux args' tys (.app e arg) (body.instantiate1 arg)
-    | _ => .none
+      toExprAux args' (.app e arg) (body.instantiate1 arg)
+    | _ => throwError "Auto.Monomorphization.ConstInst.toExpr :: Expected a function binder"
 
 def ConstInst.toExpr (ci : ConstInst) : MetaM Expr := do
   let type ← instantiateMVars (← ci.head.inferType)
@@ -353,9 +374,7 @@ def ConstInst.toExpr (ci : ConstInst) : MetaM Expr := do
   let mut args : Array (Option Expr) := (Array.mk (List.range nargs)).map (fun _ => .none)
   for (arg, idx) in ci.argsInst.zip ci.argsIdx do
     args := args.setIfInBounds idx (.some arg)
-  let .some ret := ConstInst.toExprAux args.toList [] ci.head.toExpr type
-    | throwError "{decl_name%} :: Unexpected error"
-  return ret
+  ConstInst.toExprAux args.toList ci.head.toExpr type
 
 /--
   Precondition : `.some ci == ← ConstInst.ofExpr? e`
@@ -629,13 +648,18 @@ def termLikeDefEqDefEqs (lemmas : Array Lemma) : MetaM (Array Lemma) := do
   let nses := nses.map (fun (e, params) =>
     let params := params.filter (fun n => (Std.HashSet.ofArray (collectLevelParams {} e).params).contains n)
     (e, params))
+  -- Keep the first occurrence of each expression/parameter pair. Repeated
+  -- source terms contribute no new definitional equalities. Preserve order
+  -- because only a monomorphic left candidate can anchor a comparison.
+  let (_, nses) := nses.foldl (fun (seen, acc) item =>
+    if seen.contains item then (seen, acc) else (seen.insert item, acc.push item))
+    (({} : Std.HashSet (Expr × Array Name)), (#[] : Array (Expr × Array Name)))
   let mut ret := #[]
   let mode := auto.mono.termLikeDefEq.mode.get (← getOptions)
   let heartbeats := auto.mono.termLikeDefEq.maxHeartbeats.get (← getOptions)
   for ((n₁, params₁), idx₁) in nses.zipIdx do
     if n₁.isLambda || params₁.size != 0 then continue
-    for ((n₂, params₂), idx₂) in nses.zipIdx do
-      if idx₁ >= idx₂ then continue
+    for (n₂, params₂) in nses[(idx₁ + 1):] do
         let computation := Meta.withNewMCtxDepth <| Meta.withTransparency mode <| Expr.instanceOf? n₂ params₂ n₁
         let computation := Meta.runtimeExToExcept <| Meta.withMaxHeartbeats heartbeats <| computation
         if let .ok (.some (proof, eq, params)) ← computation then
@@ -812,6 +836,11 @@ def collectMonoMutInds : MonoM (Array (Array SimpleIndVal)) := do
   let citys ← cis.mapM (fun ci => do
     let cie ← ci.toExpr
     let ty ← Meta.inferType cie
+    -- Inferred signature types can contain primitive projections even when
+    -- the input facts were normalized. Restore the collector's syntax at
+    -- this boundary, while preserving exact structure parameters.
+    let ty ← Meta.transform ty (pre := fun e => do
+      return .continue (← unfoldProj e.consumeMData))
     return Expr.eraseMData ty)
   let minds ← collectExprsSimpleInduct citys
   let cis ← (minds.flatMap id).mapM (fun ⟨_, type, ctors, projs⟩ => do
@@ -1098,12 +1127,18 @@ where
     return (s.ffvars, Reif.State.mk uvalids polyVal s.tyCanMap inhs monoIndVals none)
   fvarRepMFactAction (lis : Array LemmaInst) : FVarRep.FVarRepM (Array UMonoFact) := lis.filterMapM (fun li => do
     trace[auto.mono.fvarRepFact] "{li.type}"
+    let savedRepresentation : FVarRep.State ← get
+    let savedMeta : MetaState.State ← getThe MetaState.State
     let liTypeRep? ← FVarRep.replacePolyWithFVar li.type
     match liTypeRep? with
     | .inl liTypeRep => return .some ⟨li.proof, liTypeRep, li.deriv⟩
     | .inr m =>
-      if (← getIgnoreNonQuasiHigherOrder) then
-        trace[auto.mono] "Don't know how to deal with fact {li.type}, ignoring it"
+      if (← mayOmitUnsupportedFact li.deriv) then
+        -- Failed abstraction may have introduced bound variables and partial
+        -- atom/type entries. None may leak into the next retained fact.
+        set savedRepresentation
+        modifyThe MetaState.State (fun _ => savedMeta)
+        trace[auto.mono] "Omitting unsupported optional fact {li.deriv.toString}: {m}"
         return .none
       else
         throwError m)
