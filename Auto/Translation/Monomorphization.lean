@@ -111,6 +111,12 @@ register_option auto.mono.ignoreUnsupportedFactPrefixes : String := {
            "that may be omitted when higher-order abstraction is unsupported"
 }
 
+register_option auto.mono.extensionRounds : Nat := {
+  defValue := 3
+  descr := "Maximum number of times the caller-supplied extension of `monomorphize` " ++
+           "derives new facts from the saturated instances"
+}
+
 
 namespace Auto.Monomorphization
 open Embedding
@@ -325,7 +331,12 @@ def ConstInst.ofExpr? (params : Array Name) (bvars : Array Expr) (e : Expr) : Me
         return .none
       argsIdx := argsIdx.push idx
       argsInst := argsInst.push arg
-    headType := body.instantiate1 arg
+    -- Instantiating a type family such as `β := fun _ => γ` in
+    -- `DFunLike.coe : F → (a : α) → β a` leaves the redex `(fun _ => γ) a`.
+    -- Reduce it, so that `a` is recognized as a non-dependent argument;
+    -- otherwise every application `⇑f x` becomes a separate opaque instance
+    -- and `x` is hidden from the prover.
+    headType ← Core.betaReduce (body.instantiate1 arg)
   headType ← Meta.withTransparency .default <| Meta.whnf headType
   if (Expr.depArgs headType).size != 0 || (Expr.instArgs headType).size != 0 then
     return .none
@@ -690,6 +701,18 @@ def initializeMonoM (lemmas : Array Lemma) : MonoM Unit := do
   for lem in lemmas do
     let cis ← collectConstInsts lem.params #[] lem.type
     for ci in cis do
+      processConstInst ci
+
+/-- Add lemmas after saturation, e.g. facts derived from the instances found so
+far. Each lemma gets its own slot in `lisArr`, exactly as an input lemma. -/
+def addLemmas (lemmas : Array Lemma) : MonoM Unit := do
+  for lem in lemmas do
+    let li ← LemmaInst.ofLemmaHOL lem
+    trace[auto.mono.printLemmaInst] "New {li}"
+    let idx := (← getLisArr).size
+    setLisArr ((← getLisArr).push #[li])
+    setActive ((← getActive).enqueue (.inr (li, idx)))
+    for ci in ← collectConstInsts lem.params #[] lem.type do
       processConstInst ci
 
 def dequeueActive? : MonoM (Option (ConstInst ⊕ (LemmaInst × Nat))) := do
@@ -1086,7 +1109,15 @@ namespace FVarRep
 
 end FVarRep
 
-def monomorphize (lemmas : Array Lemma) (inhFacts : Array Lemma) (k : Reif.State → MetaM α) : MetaM α := do
+/--
+  `extend` receives the monomorphic instances after saturation and may return
+  further facts, e.g. definitionally expanded copies of the instances. They are
+  saturated in turn (instances of their constants are matched against all
+  lemmas), for at most `auto.mono.extensionRounds` rounds. Facts whose type
+  already occurs are ignored.
+-/
+def monomorphize (lemmas : Array Lemma) (inhFacts : Array Lemma) (k : Reif.State → MetaM α)
+    (extend : Array Lemma → MetaM (Array Lemma) := fun _ => pure #[]) : MetaM α := do
   for h in lemmas do
     trace[auto.mono.printInputLemmas] "Monomorphization got input lemma :: {h.type}"
   let ((monoLemmas, monoIndVals), monoSt) ← monoMAction.run {}
@@ -1098,6 +1129,16 @@ where
     let startTime ← IO.monoMsNow
     initializeMonoM lemmas
     saturate
+    for _ in [:auto.mono.extensionRounds.get (← getOptions)] do
+      let current := (← getAllMonoLemmaInsts).map (·.toLemma)
+      let known : Std.HashSet Expr := .ofArray (current.map (·.type))
+      let (_, added) := (← extend current).foldl (fun (seen, added) (lem : Lemma) =>
+        if seen.contains lem.type then (seen, added) else (seen.insert lem.type, added.push lem))
+        (known, (#[] : Array Lemma))
+      if added.isEmpty then break
+      trace[auto.mono] "Monomorphization extension added {added.size} facts"
+      addLemmas added
+      saturate
     let monoLemmas ← getAllMonoLemmaInsts
     let monoIndVals ← collectMonoMutInds
     trace[auto.mono] "Monomorphization of lemmas took {(← IO.monoMsNow) - startTime}ms"
