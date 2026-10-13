@@ -111,6 +111,13 @@ register_option auto.mono.ignoreUnsupportedFactPrefixes : String := {
            "that may be omitted when higher-order abstraction is unsupported"
 }
 
+register_option auto.mono.betaReduceInstanceTypes : Bool := {
+  defValue := true
+  descr := "Beta-reduce the remaining type of a constant instance before deciding " ++
+    "which arguments are dependent, so that `⇑f x` with `β := fun _ => γ` keeps `x` " ++
+    "as an ordinary argument"
+}
+
 register_option auto.mono.extensionRounds : Nat := {
   defValue := 3
   descr := "Maximum number of times the caller-supplied extension of `monomorphize` " ++
@@ -336,7 +343,8 @@ def ConstInst.ofExpr? (params : Array Name) (bvars : Array Expr) (e : Expr) : Me
     -- Reduce it, so that `a` is recognized as a non-dependent argument;
     -- otherwise every application `⇑f x` becomes a separate opaque instance
     -- and `x` is hidden from the prover.
-    headType ← Core.betaReduce (body.instantiate1 arg)
+    headType ← if auto.mono.betaReduceInstanceTypes.get (← getOptions) then
+      Core.betaReduce (body.instantiate1 arg) else pure (body.instantiate1 arg)
   headType ← Meta.withTransparency .default <| Meta.whnf headType
   if (Expr.depArgs headType).size != 0 || (Expr.instArgs headType).size != 0 then
     return .none
