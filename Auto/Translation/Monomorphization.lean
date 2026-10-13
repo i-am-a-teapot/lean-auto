@@ -879,13 +879,20 @@ namespace FVarRep
     let ffvars ← getFfvars
     return Std.HashSet.emptyWithCapacity.insertMany ffvars
 
+  /-- Inferred signatures and binder reduction can expose a specialization
+  after saturation. Intern it in the abstraction cache as an actual Lean
+  constant value, retaining the existing representative for equivalent ones.
+  This adds no logical fact and does not restart saturation. -/
+  def canonicalizeConstInst (ci : ConstInst) : FVarRepM ConstInst := do
+    let (old?, insts, ci) ← MetaState.runMetaM <| CiMap.canonicalize? (← getCiMap) ci
+    unless old? do
+      trace[auto.mono.printConstInst] "New {ci}"
+      setCiMap ((← getCiMap).insert ci.fingerPrint (insts.push ci))
+    return ci
+
   /-- Similar to `Monomorphization.processConstInst` -/
   def processConstInst (ci : ConstInst) : FVarRepM Unit := do
-    let (old?, insts, ci) ← MetaState.runMetaM <| CiMap.canonicalize? (← getCiMap) ci
-    if old? then
-      return
-    trace[auto.mono.printConstInst] "New {ci}"
-    setCiMap ((← getCiMap).insert ci.fingerPrint (insts.push ci))
+    discard <| canonicalizeConstInst ci
 
   /-- Return : (reduce(e), whether reduce(e) contain bfvars) -/
   def processType (e : Expr) : FVarRepM (Expr × Bool) := do
@@ -920,11 +927,7 @@ namespace FVarRep
       setTyCanMap ((← getTyCanMap).insert e e)
 
   def constInst2FVarId (ci : ConstInst) : FVarRepM FVarId := do
-    let ciMap ← FVarRep.getCiMap
-    let ci ← MetaState.runMetaM (do
-      match ← CiMap.canonicalize? ciMap ci with
-      | (true, _, ci') => return ci'
-      | _ => throwError "{decl_name%} :: Cannot find canonicalized instance of {ci}")
+    let ci ← canonicalizeConstInst ci
     let ciIdMap ← FVarRep.getCiIdMap
     match ciIdMap.get? ci with
     | .some fid => return fid
@@ -1129,7 +1132,12 @@ where
     trace[auto.mono.fvarRepFact] "{li.type}"
     let savedRepresentation : FVarRep.State ← get
     let savedMeta : MetaState.State ← getThe MetaState.State
-    let liTypeRep? ← FVarRep.replacePolyWithFVar li.type
+    -- An abstraction step can also throw, e.g. when a const instance has no
+    -- canonical representative. Treat that like any other unsupported
+    -- expression, so an optional fact is omitted rather than aborting the
+    -- problem. Runtime exceptions (heartbeats, interrupts) still propagate.
+    let liTypeRep? ← try FVarRep.replacePolyWithFVar li.type
+      catch error => pure (.inr error.toMessageData)
     match liTypeRep? with
     | .inl liTypeRep => return .some ⟨li.proof, liTypeRep, li.deriv⟩
     | .inr m =>
@@ -1141,7 +1149,7 @@ where
         trace[auto.mono] "Omitting unsupported optional fact {li.deriv.toString}: {m}"
         return .none
       else
-        throwError m)
+        throwError "{m}\nSource fact: {li.deriv}")
   fvarRepMInductAction (ivals : Array (Array SimpleIndVal)) : FVarRep.FVarRepM (Array (Array SimpleIndVal)) :=
     ivals.mapM (fun svals => svals.mapM (fun ⟨name, type, ctors, projs⟩ => do
       let (type, _) ← FVarRep.processType type
@@ -1151,12 +1159,12 @@ where
         match valRep? with
         | .inl valRep => return (valRep, ty)
         -- If monomorphization fails on one constructor, fail immediately
-        | .inr m => throwError m)
+        | .inr m => throwError "{m}\nInductive constructor: {name}")
       let projs ← projs.mapM (fun arr => arr.mapM (fun e => do
         match ← FVarRep.replacePolyWithFVar e with
         | .inl e => return e
         -- If monomorphization fails on one projection, fail immediately
-        | .inr m => throwError m))
+        | .inr m => throwError "{m}\nInductive projection: {name}"))
       return ⟨name, type, ctors, projs⟩))
 
 end Auto.Monomorphization
