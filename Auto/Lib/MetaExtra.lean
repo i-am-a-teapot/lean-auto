@@ -69,7 +69,8 @@ def Meta.trySynthInhabited (e : Expr) : MetaM (Option Expr) := do
   let .sort lvl := eSort
     | throwError "{decl_name%} :: {e} is not a type"
   try
-    if let .some inh ← Meta.synthInstance? e then
+    let direct? ← try Meta.synthInstance? e catch _ => pure none
+    if let .some inh := direct? then
       return .some inh
     if let .some inh ← Meta.synthInstance? (Lean.mkApp (.const ``Inhabited [lvl]) e) then
       return .some (Lean.mkApp2 (.const ``Inhabited.default [lvl]) e inh)

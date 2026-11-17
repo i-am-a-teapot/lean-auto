@@ -106,8 +106,39 @@ register_option auto.mono.ignoreNonQuasiHigherOrder : Bool := {
 }
 
 
+register_option auto.mono.ignoreUnsupportedFactPrefixes : String := {
+  defValue := ""
+  descr := "Semicolon-separated derivation-label prefixes for optional facts " ++
+           "that may be omitted when higher-order abstraction is unsupported"
+}
+
+register_option auto.mono.betaReduceInstanceTypes : Bool := {
+  defValue := true
+  descr := "Beta-reduce the remaining type of a constant instance before deciding " ++
+    "which arguments are dependent, so that `⇑f x` with `β := fun _ => γ` keeps `x` " ++
+    "as an ordinary argument"
+}
+
+register_option auto.mono.extensionRounds : Nat := {
+  defValue := 3
+  descr := "Maximum number of times the caller-supplied extension of `monomorphize` " ++
+           "derives new facts from the saturated instances"
+}
+
+
 namespace Auto.Monomorphization
 open Embedding
+
+/-- A mixed derivation containing a required leaf must never be omitted. -/
+private partial def derivesOnlyFromPrefixes (prefixes : List String) : DTr → Bool
+  | .leaf label => prefixes.any (fun labelPrefix => label.startsWith labelPrefix)
+  | .node _ premises => !premises.isEmpty && premises.all (derivesOnlyFromPrefixes prefixes)
+
+private def mayOmitUnsupportedFact (derivation : DTr) : CoreM Bool := do
+  if auto.mono.ignoreNonQuasiHigherOrder.get (← getOptions) then return true
+  let prefixes := (auto.mono.ignoreUnsupportedFactPrefixes.get (← getOptions)).splitOn ";"
+    |>.filter (!·.isEmpty)
+  return derivesOnlyFromPrefixes prefixes derivation
 
 def getRecordInstInst : CoreM Bool := do
   return auto.mono.recordInstInst.get (← getOptions)
@@ -297,7 +328,8 @@ def ConstInst.ofExpr? (params : Array Name) (bvars : Array Expr) (e : Expr) : Me
   let mut argsInst := #[]
   -- Check that all dependent and instance arguments are instantiated
   for (arg, idx) in args.zipIdx do
-    headType ← Core.betaReduce headType
+    -- Function types may be definition aliases, for example `Set α`.
+    headType ← Meta.withTransparency .default <| Meta.whnf headType
     let .forallE _ ty body bi := headType
       | throwError "{decl_name%} :: {headType} is not a `∀`"
     if let some _ := ty.find? (fun e => bvarSet.contains e) then
@@ -307,8 +339,14 @@ def ConstInst.ofExpr? (params : Array Name) (bvars : Array Expr) (e : Expr) : Me
         return .none
       argsIdx := argsIdx.push idx
       argsInst := argsInst.push arg
-    headType := body.instantiate1 arg
-  headType ← Core.betaReduce headType
+    -- Instantiating a type family such as `β := fun _ => γ` in
+    -- `DFunLike.coe : F → (a : α) → β a` leaves the redex `(fun _ => γ) a`.
+    -- Reduce it, so that `a` is recognized as a non-dependent argument;
+    -- otherwise every application `⇑f x` becomes a separate opaque instance
+    -- and `x` is hidden from the prover.
+    headType ← if auto.mono.betaReduceInstanceTypes.get (← getOptions) then
+      Core.betaReduce (body.instantiate1 arg) else pure (body.instantiate1 arg)
+  headType ← Meta.withTransparency .default <| Meta.whnf headType
   if (Expr.depArgs headType).size != 0 || (Expr.instArgs headType).size != 0 then
     return .none
   return .some ⟨head, argsInst, argsIdx⟩
@@ -330,23 +368,25 @@ where
     | .hol => return dep || inst
     | .fol => return dep || (!isPolyIL && hol) || inst
 
-private def ConstInst.toExprAux (args : List (Option Expr))
-  (tys : List (Name × Expr × BinderInfo)) (e ty : Expr) : Option Expr :=
+private partial def ConstInst.toExprAux (args : List (Option Expr))
+  (e ty : Expr) : MetaM Expr := do
   match args with
-  | .nil =>
-    Option.some <| Prod.fst <| tys.foldl (fun (e, idx) (name, bty, bi) =>
-      (Expr.lam name bty e bi, .succ idx)) (e, 0)
+  | .nil => return e
   | .none :: args' =>
-    match ty with
+    match ← Meta.whnf ty with
     | .forallE name bty body bi =>
-      let bvar := .bvar tys.length
-      toExprAux args' ((name, bty, bi) :: tys) (.app e bvar) (body.instantiate1 bvar)
-    | _ => .none
+      -- Abstract with fresh locals instead of assigning de Bruijn indices
+      -- before all binders are known. Adding a second binder must not swap
+      -- the first two arguments or capture an instantiated argument.
+      Meta.withLocalDecl name bi bty fun argument => do
+        let result ← toExprAux args' (.app e argument) (body.instantiate1 argument)
+        Meta.mkLambdaFVars #[argument] result
+    | _ => throwError "Auto.Monomorphization.ConstInst.toExpr :: Expected a function binder"
   | .some arg :: args' =>
-    match ty with
+    match ← Meta.whnf ty with
     | .forallE _ _ body _ =>
-      toExprAux args' tys (.app e arg) (body.instantiate1 arg)
-    | _ => .none
+      toExprAux args' (.app e arg) (body.instantiate1 arg)
+    | _ => throwError "Auto.Monomorphization.ConstInst.toExpr :: Expected a function binder"
 
 def ConstInst.toExpr (ci : ConstInst) : MetaM Expr := do
   let type ← instantiateMVars (← ci.head.inferType)
@@ -354,9 +394,7 @@ def ConstInst.toExpr (ci : ConstInst) : MetaM Expr := do
   let mut args : Array (Option Expr) := (Array.mk (List.range nargs)).map (fun _ => .none)
   for (arg, idx) in ci.argsInst.zip ci.argsIdx do
     args := args.setIfInBounds idx (.some arg)
-  let .some ret := ConstInst.toExprAux args.toList [] ci.head.toExpr type
-    | throwError "{decl_name%} :: Unexpected error"
-  return ret
+  ConstInst.toExprAux args.toList ci.head.toExpr type
 
 /--
   Precondition : `.some ci == ← ConstInst.ofExpr? e`
@@ -397,9 +435,9 @@ private partial def collectConstInsts (params : Array Name) (bvars : Array Expr)
     return insts
   else
     return insts ++ (← collectConstInsts params bvars ty)
-| .letE .. => throwError "{decl_name%} :: Let-expressions should have been reduced"
-| .mdata .. => throwError "{decl_name%} :: mdata should have been consumed"
-| .proj .. => throwError "{decl_name%} :: Projections should have been turned into ordinary expressions"
+| .letE _ _ value body _ => collectConstInsts params bvars (body.instantiate1 value)
+| .mdata _ body => collectConstInsts params bvars body
+| e@(.proj ..) => do collectConstInsts params bvars (← unfoldProj e)
 | _ => return #[]
 where processOther (params : Array Name) (e : Expr) : MetaM (Array ConstInst) := do
   match ← ConstInst.ofExpr? params bvars e with
@@ -450,9 +488,9 @@ private partial def MLemmaInst.matchConstInst (ci : ConstInst) (mi : MLemmaInst)
     let tyInst ← MLemmaInst.matchConstInst ci mi ty
     let bodyInst ← MLemmaInst.matchConstInst ci mi (body.instantiate1 x)
     return mergeHashSet tyInst bodyInst
-| .letE .. => throwError "{decl_name%} :: Let-expressions should have been reduced"
-| .mdata .. => throwError "{decl_name%} :: mdata should have been consumed"
-| .proj .. => throwError "{decl_name%} :: Projections should have been turned into ordinary expressions"
+| .letE _ _ value body _ => MLemmaInst.matchConstInst ci mi (body.instantiate1 value)
+| .mdata _ body => MLemmaInst.matchConstInst ci mi body
+| e@(.proj ..) => do MLemmaInst.matchConstInst ci mi (← unfoldProj e)
 | _ => return Std.HashSet.emptyWithCapacity
 
 /-- Given a LemmaInst `li` and a ConstInst `ci`, try to match all subexpressions of `li` against `ci` -/
@@ -669,6 +707,18 @@ def initializeMonoM (lemmas : Array Lemma) : MonoM Unit := do
     for ci in cis do
       processConstInst ci
 
+/-- Add lemmas after saturation, e.g. facts derived from the instances found so
+far. Each lemma gets its own slot in `lisArr`, exactly as an input lemma. -/
+def addLemmas (lemmas : Array Lemma) : MonoM Unit := do
+  for lem in lemmas do
+    let li ← LemmaInst.ofLemmaHOL lem
+    trace[auto.mono.printLemmaInst] "New {li}"
+    let idx := (← getLisArr).size
+    setLisArr ((← getLisArr).push #[li])
+    setActive ((← getActive).enqueue (.inr (li, idx)))
+    for ci in ← collectConstInsts lem.params #[] lem.type do
+      processConstInst ci
+
 def dequeueActive? : MonoM (Option (ConstInst ⊕ (LemmaInst × Nat))) := do
   match (← getActive).dequeue? with
   | .some (elem, ac') =>
@@ -851,13 +901,20 @@ namespace FVarRep
     let ffvars ← getFfvars
     return Std.HashSet.emptyWithCapacity.insertMany ffvars
 
+  /-- Inferred signatures and binder reduction can expose a specialization
+  after saturation. Intern it in the abstraction cache as an actual Lean
+  constant value, retaining the existing representative for equivalent ones.
+  This adds no logical fact and does not restart saturation. -/
+  def canonicalizeConstInst (ci : ConstInst) : FVarRepM ConstInst := do
+    let (old?, insts, ci) ← MetaState.runMetaM <| CiMap.canonicalize? (← getCiMap) ci
+    unless old? do
+      trace[auto.mono.printConstInst] "New {ci}"
+      setCiMap ((← getCiMap).insert ci.fingerPrint (insts.push ci))
+    return ci
+
   /-- Similar to `Monomorphization.processConstInst` -/
   def processConstInst (ci : ConstInst) : FVarRepM Unit := do
-    let (old?, insts, ci) ← MetaState.runMetaM <| CiMap.canonicalize? (← getCiMap) ci
-    if old? then
-      return
-    trace[auto.mono.printConstInst] "New {ci}"
-    setCiMap ((← getCiMap).insert ci.fingerPrint (insts.push ci))
+    discard <| canonicalizeConstInst ci
 
   /-- Return : (reduce(e), whether reduce(e) contain bfvars) -/
   def processType (e : Expr) : FVarRepM (Expr × Bool) := do
@@ -892,11 +949,7 @@ namespace FVarRep
       setTyCanMap ((← getTyCanMap).insert e e)
 
   def constInst2FVarId (ci : ConstInst) : FVarRepM FVarId := do
-    let ciMap ← FVarRep.getCiMap
-    let ci ← MetaState.runMetaM (do
-      match ← CiMap.canonicalize? ciMap ci with
-      | (true, _, ci') => return ci'
-      | _ => throwError "{decl_name%} :: Cannot find canonicalized instance of {ci}")
+    let ci ← canonicalizeConstInst ci
     let ciIdMap ← FVarRep.getCiIdMap
     match ciIdMap.get? ci with
     | .some fid => return fid
@@ -954,6 +1007,9 @@ namespace FVarRep
     · Throw an error message if unexpected error happens
   -/
   partial def replacePolyWithFVar : Expr → FVarRepM (Expr ⊕ MessageData)
+  | .letE _ _ value body _ => replacePolyWithFVar (body.instantiate1 value)
+  | .mdata _ body => replacePolyWithFVar body
+  | e@(.proj ..) => do replacePolyWithFVar (← MetaState.runMetaM (unfoldProj e))
   | .lam name ty body binfo => do
     -- Type of λ binder cannot depend on previous bound variables
     let (ty, hasBfvars) ← processType ty
@@ -1055,7 +1111,11 @@ namespace FVarRep
 
 end FVarRep
 
-def monomorphize (lemmas : Array Lemma) (inhFacts : Array Lemma) (k : Reif.State → MetaM α) : MetaM α := do
+/-- Extend the saturated monomorphic facts with proved caller-generated facts.
+Repeated fact types are ignored; extension is bounded by `auto.mono.extensionRounds`.
+The default callback preserves ordinary lean-auto behavior. -/
+def monomorphize (lemmas : Array Lemma) (inhFacts : Array Lemma) (k : Reif.State → MetaM α)
+    (extend : Array Lemma → MetaM (Array Lemma) := fun _ => pure #[]) : MetaM α := do
   for h in lemmas do
     trace[auto.mono.printInputLemmas] "Monomorphization got input lemma :: {h.type}"
   let ((monoLemmas, monoIndVals), monoSt) ← monoMAction.run {}
@@ -1067,6 +1127,16 @@ where
     let startTime ← IO.monoMsNow
     initializeMonoM lemmas
     saturate
+    for _ in [:auto.mono.extensionRounds.get (← getOptions)] do
+      let current := (← getAllMonoLemmaInsts).map (·.toLemma)
+      let known : Std.HashSet Expr := .ofArray (current.map (·.type))
+      let (_, added) := (← extend current).foldl (fun (seen, added) (lem : Lemma) =>
+        if seen.contains lem.type then (seen, added) else (seen.insert lem.type, added.push lem))
+        (known, (#[] : Array Lemma))
+      if added.isEmpty then break
+      trace[auto.mono] "Monomorphization extension added {added.size} facts"
+      addLemmas added
+      saturate
     let monoLemmas ← getAllMonoLemmaInsts
     let monoIndVals ← collectMonoMutInds
     trace[auto.mono] "Monomorphization of lemmas took {(← IO.monoMsNow) - startTime}ms"
@@ -1103,7 +1173,7 @@ where
     match liTypeRep? with
     | .inl liTypeRep => return .some ⟨li.proof, liTypeRep, li.deriv⟩
     | .inr m =>
-      if (← getIgnoreNonQuasiHigherOrder) then
+      if (← mayOmitUnsupportedFact li.deriv) then
         trace[auto.mono] "Don't know how to deal with fact {li.type}, ignoring it"
         return .none
       else

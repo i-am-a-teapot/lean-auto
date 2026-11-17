@@ -174,9 +174,9 @@ mutual
       return
     collectExprSimpleInduct ty
     collectExprSimpleInduct body
-  | .letE .. => throwError "{decl_name%} :: Let-expressions should have been reduced"
-  | .mdata .. => throwError "{decl_name%} :: mdata should have been consumed"
-  | .proj .. => throwError "{decl_name%} :: Projections should have been turned into ordinary expressions"
+  | .letE _ _ value body _ => collectExprSimpleInduct (body.instantiate1 value)
+  | .mdata _ body => collectExprSimpleInduct body
+  | e@(.proj ..) => do collectExprSimpleInduct (← unfoldProj e)
   | e => collectAppInstSimpleInduct e
 
 end
